@@ -19,6 +19,8 @@ dependencies {
     implementation("org.postgresql:postgresql:42.7.7")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.18.3")
     implementation("org.slf4j:slf4j-simple:2.0.17")
+    testImplementation(kotlin("test"))
+    testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
 }
 
 application {
@@ -44,4 +46,12 @@ tasks.jar {
 
 tasks.named<JavaExec>("run") {
     environment("PORT", System.getenv("PORT") ?: "4013")
+}
+
+tasks.test {
+    useJUnitPlatform()
+    testLogging {
+        events("passed", "failed", "skipped", "standardOut", "standardError")
+        showStandardStreams = true
+    }
 }
