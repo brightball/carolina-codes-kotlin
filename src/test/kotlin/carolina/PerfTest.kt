@@ -22,6 +22,14 @@ class PerfTest {
         assertTrue(src.contains("sslmode=disable"), "JDBC should keep sslmode=disable")
         assertTrue(src.contains("ssl=false"), "JDBC should keep ssl=false")
         assertTrue(jdbcUrl().contains("sslmode=disable"), "jdbcUrl includes sslmode=disable")
+        assertTrue(jdbcUrl().contains("connectTimeout=10"), "jdbcUrl includes connectTimeout")
+        assertTrue(jdbcUrl().contains("socketTimeout=30"), "jdbcUrl includes socketTimeout")
+        assertTrue(jdbcUrl().contains("loginTimeout=10"), "jdbcUrl includes loginTimeout")
+        assertTrue(src.contains("Dispatchers.IO"), "DB work should leave the CIO event loop")
+        assertTrue(src.contains("POOL_WAIT_MS"), "pool acquire should time out")
+        assertTrue(src.contains("POOL_WARM"), "pool should warm more than one connection")
+        assertTrue(src.contains("yearsFromTalks"), "slug detail should derive years from talks")
+        assertTrue(src.contains("writeValueAsBytes"), "JSON should avoid String materialization")
     }
 
     @Test

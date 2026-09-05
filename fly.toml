@@ -10,6 +10,7 @@ primary_region = "iad"
   PORT = "8080"
   CAROLINA_URL = "http://carolina-codes.internal:8080"
   PUBLIC_BASE_URL = "https://carolina-codes-kotlin.fly.dev"
+  JAVA_OPTS = "-XX:MaxRAMPercentage=55.0 -XX:+UseG1GC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError"
 
 [http_service]
   internal_port = 8080
@@ -20,7 +21,7 @@ primary_region = "iad"
   processes = ["app"]
 
   [[http_service.checks]]
-    grace_period = "40s"
+    grace_period = "90s"
     interval = "30s"
     method = "GET"
     path = "/health"

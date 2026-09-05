@@ -7,10 +7,12 @@ import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.install
 import io.ktor.server.cio.CIO
+import io.ktor.server.engine.applicationEnvironment
+import io.ktor.server.engine.connector
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.header
-import io.ktor.server.response.respondText
+import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
 import java.net.URI
@@ -22,10 +24,14 @@ import java.nio.charset.StandardCharsets
 import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.ResultSet
+import java.sql.SQLException
 import java.time.Duration
 import java.util.ArrayDeque
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 const val LANGUAGE = "Kotlin"
 const val API_VERSION = "0.2.0"
@@ -56,6 +62,8 @@ const val SPONSOR_COLS =
     "slug, name, website, logo_path, description, twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url"
 
 internal const val POOL_SIZE = 8
+internal const val POOL_WARM = 4
+internal const val POOL_WAIT_MS = 10_000L
 internal val mapper = jacksonObjectMapper()
 internal val sqlCount = AtomicInteger()
 internal val connectCount = AtomicInteger()
@@ -64,16 +72,30 @@ private val poolLock = Any()
 private val idle = ArrayDeque<Connection>()
 private var poolOpened = 0
 private var poolReady = false
+private var driverLoaded = false
 
 internal var connectFn: (() -> Connection)? = null
 internal var queryFn: ((String, Array<out Any?>) -> MutableList<MutableMap<String, Any?>>)? = null
 
 fun main() {
+    loadDriver()
     openPool()
-    val port = env("PORT", "4013").toInt()
-    thread(isDaemon = true, name = "polyglot-register") { register(port) }
-    embeddedServer(CIO, host = listenHost(), port = port, module = Application::carolinaModule)
-        .start(wait = true)
+    val listenPort = env("PORT", "4013").toInt()
+    thread(isDaemon = true, name = "polyglot-register") { register(listenPort) }
+    embeddedServer(
+        CIO,
+        applicationEnvironment(),
+        {
+            connector {
+                host = listenHost()
+                port = listenPort
+            }
+            connectionGroupSize = 1
+            workerGroupSize = 1
+            callGroupSize = 2
+        },
+        Application::carolinaModule,
+    ).start(wait = true)
 }
 
 internal fun listenHost(): String = "::"
@@ -105,24 +127,24 @@ fun Application.carolinaModule() {
         }
         get("/health") { call.json(mapOf("ok" to true)) }
         get("/v1/years") {
-            val rows = withDb { conn ->
+            val rows = withDbIo { conn ->
                 query(conn, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC")
             }
             call.json(mapOf("data" to rows))
         }
         get("/v1/speakers") {
             val year = call.request.queryParameters["year"]?.toIntOrNull()
-            val speakers = withDb { conn -> listSpeakers(conn, year) }
+            val speakers = withDbIo { conn -> listSpeakers(conn, year) }
             call.json(mapOf("data" to speakers))
         }
         get("/v1/speakers/{year}/{slug}") {
             val year = call.parameters["year"]?.toIntOrNull()
             val slug = call.parameters["slug"] ?: return@get call.notFound()
             if (year == null) return@get call.notFound()
-            val speaker = withDb { conn ->
-                val row = loadSpeaker(conn, slug) ?: return@withDb null
+            val speaker = withDbIo { conn ->
+                val row = loadSpeaker(conn, slug) ?: return@withDbIo null
                 val talks = talksFor(conn, slug, year)
-                if (talks.isEmpty()) return@withDb null
+                if (talks.isEmpty()) return@withDbIo null
                 val years = talkYears(conn, slug)
                 row["year"] = year
                 row["years"] = years
@@ -136,17 +158,18 @@ fun Application.carolinaModule() {
         }
         get("/v1/speakers/{slug}") {
             val slug = call.parameters["slug"] ?: return@get call.notFound()
-            val speaker = withDb { conn ->
-                val row = loadSpeaker(conn, slug) ?: return@withDb null
-                row["talks"] = talksFor(conn, slug, null)
-                row["years"] = talkYears(conn, slug)
+            val speaker = withDbIo { conn ->
+                val row = loadSpeaker(conn, slug) ?: return@withDbIo null
+                val talks = talksFor(conn, slug, null)
+                row["talks"] = talks
+                row["years"] = yearsFromTalks(talks)
                 row
             } ?: return@get call.notFound()
             call.json(mapOf("data" to speaker))
         }
         get("/v1/sponsors") {
             val year = call.request.queryParameters["year"]?.toIntOrNull()
-            val rows = withDb { conn ->
+            val rows = withDbIo { conn ->
                 if (year != null) {
                     query(
                         conn,
@@ -163,13 +186,13 @@ fun Application.carolinaModule() {
             val year = call.parameters["year"]?.toIntOrNull()
             val slug = call.parameters["slug"] ?: return@get call.notFound()
             if (year == null) return@get call.notFound()
-            val row = withDb { conn ->
+            val row = withDbIo { conn ->
                 val sponsor = queryOne(
                     conn,
                     "SELECT $YEAR_SPONSOR_COLS FROM v1_year_sponsors WHERE year = ? AND slug = ?",
                     year,
                     slug,
-                ) ?: return@withDb null
+                ) ?: return@withDbIo null
                 val years = sponsorYears(conn, slug)
                 sponsor["years"] = years
                 sponsor["other_years"] = years.filter { it != year }
@@ -179,12 +202,12 @@ fun Application.carolinaModule() {
         }
         get("/v1/sponsors/{slug}") {
             val slug = call.parameters["slug"] ?: return@get call.notFound()
-            val row = withDb { conn ->
+            val row = withDbIo { conn ->
                 val sponsor = queryOne(
                     conn,
                     "SELECT $SPONSOR_COLS FROM v1_sponsors WHERE slug = ?",
                     slug,
-                ) ?: return@withDb null
+                ) ?: return@withDbIo null
                 sponsor["sponsorships"] = query(
                     conn,
                     "SELECT sponsor_slug, year, tier, blurb, featured FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC",
@@ -201,7 +224,7 @@ fun Application.carolinaModule() {
 private suspend fun ApplicationCall.json(payload: Any, status: HttpStatusCode = HttpStatusCode.OK) {
     response.header("X-Polyglot-Language", LANGUAGE)
     response.header("X-Polyglot-Framework", FRAMEWORK)
-    respondText(mapper.writeValueAsString(payload), ContentType.Application.Json, status)
+    respondBytes(mapper.writeValueAsBytes(payload), ContentType.Application.Json, status)
 }
 
 private suspend fun ApplicationCall.notFound() {
@@ -227,11 +250,28 @@ internal fun jdbcUrl(): String {
     var jdbc = "jdbc:postgresql://$host:$port/$db?user=$user&password=$pass$extra"
     if (!jdbc.contains("sslmode=")) jdbc += "&sslmode=disable"
     if (!jdbc.contains("ssl=")) jdbc += "&ssl=false"
+    jdbc = appendParam(jdbc, "tcpKeepAlive", "true")
+    jdbc = appendParam(jdbc, "connectTimeout", "10")
+    jdbc = appendParam(jdbc, "socketTimeout", "30")
+    jdbc = appendParam(jdbc, "loginTimeout", "10")
+    jdbc = appendParam(jdbc, "ApplicationName", "carolina-codes-kotlin")
     return jdbc
 }
 
-internal fun newJdbc(): Connection {
+internal fun appendParam(jdbc: String, key: String, value: String): String {
+    if (jdbc.contains("$key=")) return jdbc
+    return "$jdbc&$key=$value"
+}
+
+internal fun loadDriver() {
+    if (driverLoaded) return
     Class.forName("org.postgresql.Driver")
+    DriverManager.setLoginTimeout(10)
+    driverLoaded = true
+}
+
+internal fun newJdbc(): Connection {
+    loadDriver()
     return DriverManager.getConnection(jdbcUrl())
 }
 
@@ -246,6 +286,14 @@ internal fun openPool() {
         if (poolReady) return
         idle.addLast(openConnection())
         poolOpened = 1
+        while (poolOpened < POOL_WARM) {
+            try {
+                idle.addLast(openConnection())
+                poolOpened++
+            } catch (_: Exception) {
+                break
+            }
+        }
         poolReady = true
     }
 }
@@ -253,14 +301,63 @@ internal fun openPool() {
 internal fun acquire(): Connection {
     synchronized(poolLock) {
         if (!poolReady) openPool()
-        while (true) {
-            if (idle.isNotEmpty()) return idle.removeFirst()
-            if (poolOpened < POOL_SIZE) {
-                poolOpened++
-                return openConnection()
+    }
+    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(POOL_WAIT_MS)
+    while (true) {
+        val conn = takeIdleOrGrow()
+        if (conn != null) {
+            if (usable(conn)) return conn
+            discardBroken(conn)
+            continue
+        }
+        val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+        if (remainingMs <= 0) {
+            throw SQLException("connection pool exhausted")
+        }
+        synchronized(poolLock) {
+            if (idle.isEmpty() && poolOpened >= POOL_SIZE) {
+                @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
+                (poolLock as Object).wait(remainingMs)
             }
+        }
+    }
+}
+
+internal fun takeIdleOrGrow(): Connection? {
+    synchronized(poolLock) {
+        if (idle.isNotEmpty()) return idle.removeFirst()
+        if (poolOpened >= POOL_SIZE) return null
+        poolOpened++
+    }
+    return try {
+        openConnection()
+    } catch (exc: Exception) {
+        synchronized(poolLock) {
+            poolOpened = (poolOpened - 1).coerceAtLeast(0)
             @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
-            (poolLock as Object).wait()
+            (poolLock as Object).notify()
+        }
+        throw exc
+    }
+}
+
+internal fun usable(conn: Connection): Boolean {
+    if (connectFn != null) return true
+    return try {
+        !conn.isClosed && conn.isValid(1)
+    } catch (_: SQLException) {
+        false
+    }
+}
+
+internal fun discardBroken(conn: Connection?) {
+    synchronized(poolLock) {
+        poolOpened = (poolOpened - 1).coerceAtLeast(0)
+    }
+    if (conn != null) {
+        try {
+            conn.close()
+        } catch (_: Exception) {
         }
     }
 }
@@ -275,13 +372,20 @@ internal fun release(conn: Connection?) {
 }
 
 internal fun <T> withDb(block: (Connection) -> T): T {
-    val conn = acquire()
+    var conn: Connection? = acquire()
     try {
-        return block(conn)
+        return block(conn!!)
+    } catch (exc: SQLException) {
+        discardBroken(conn)
+        conn = null
+        throw exc
     } finally {
         release(conn)
     }
 }
+
+internal suspend fun <T> withDbIo(block: (Connection) -> T): T =
+    withContext(Dispatchers.IO) { withDb(block) }
 
 internal fun query(conn: Connection, sql: String, vararg args: Any?): MutableList<MutableMap<String, Any?>> {
     sqlCount.incrementAndGet()
@@ -289,8 +393,9 @@ internal fun query(conn: Connection, sql: String, vararg args: Any?): MutableLis
     conn.prepareStatement(sql).use { stmt ->
         args.forEachIndexed { index, value -> bind(stmt, conn, index + 1, value) }
         stmt.executeQuery().use { rs ->
+            val labels = columnLabels(rs)
             val out = mutableListOf<MutableMap<String, Any?>>()
-            while (rs.next()) out.add(row(rs))
+            while (rs.next()) out.add(row(rs, labels))
             return out
         }
     }
@@ -310,12 +415,15 @@ internal fun queryOne(conn: Connection, sql: String, vararg args: Any?): Mutable
     return query(conn, sql, *args).firstOrNull()
 }
 
-private fun row(rs: ResultSet): MutableMap<String, Any?> {
+private fun columnLabels(rs: ResultSet): Array<String> {
     val md = rs.metaData
+    return Array(md.columnCount) { md.getColumnLabel(it + 1) }
+}
+
+private fun row(rs: ResultSet, labels: Array<String>): MutableMap<String, Any?> {
     val out = linkedMapOf<String, Any?>()
-    for (i in 1..md.columnCount) {
-        val name = md.getColumnLabel(i)
-        out[name] = clean(rs.getObject(i))
+    for (i in labels.indices) {
+        out[labels[i]] = clean(rs.getObject(i + 1))
     }
     return out
 }
@@ -422,6 +530,12 @@ internal fun talksFor(conn: Connection, slug: String, year: Int?): List<MutableM
 internal fun talkYears(conn: Connection, slug: String): List<Int> {
     return query(conn, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC", slug)
         .map { asInt(it["year"]) }
+}
+
+internal fun yearsFromTalks(talks: List<Map<String, Any?>>): List<Int> {
+    val seen = linkedSetOf<Int>()
+    talks.forEach { seen.add(asInt(it["year"])) }
+    return seen.toList()
 }
 
 internal fun sponsorYears(conn: Connection, slug: String): List<Int> {
