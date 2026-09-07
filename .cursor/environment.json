@@ -1,0 +1,14 @@
+{
+  "name": "carolina-codes-kotlin",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "install": "./gradlew --no-daemon assemble",
+  "ports": [
+    {
+      "name": "api",
+      "port": 4013
+    }
+  ]
+}
