@@ -4,15 +4,46 @@ import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.testing.testApplication
+import java.lang.reflect.Proxy
 import java.nio.file.Files
 import java.nio.file.Path
-import java.sql.SQLException
+import java.sql.Connection
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
 class PerfTest {
+    @Test
+    fun runningJvmIsFeature27() {
+        assertEquals(27, Runtime.version().feature(), "test JVM ${Runtime.version()}")
+        val mise = Files.readString(Path.of("mise.toml"))
+        assertTrue(mise.contains("java = \"27\""), "mise Java pin is 27, got $mise")
+        val dockerfiles =
+            Files.walk(Path.of(".")).use { stream ->
+                stream
+                    .filter { Files.isRegularFile(it) && it.fileName.toString() == "Dockerfile" }
+                    .filter { path ->
+                        val s = path.toString()
+                        !s.contains("/build/") && !s.contains("/.git/")
+                    }.toList()
+            }
+        assertTrue(dockerfiles.isNotEmpty(), "expected committed Dockerfiles")
+        val cursorDocker = Path.of(".cursor/Dockerfile").toAbsolutePath().normalize()
+        assertTrue(
+            dockerfiles.any { it.toAbsolutePath().normalize() == cursorDocker },
+            "must scan .cursor/Dockerfile, found $dockerfiles",
+        )
+        dockerfiles.forEach { path ->
+            val text = Files.readString(path)
+            assertTrue(
+                !text.contains(":26-jdk") && !text.contains(":26-jre") && !text.contains("temurin:26"),
+                "$path still pins JDK 26",
+            )
+            assertTrue(text.contains(":27"), "$path should pin a JDK 27 image")
+        }
+    }
+
     @Test
     fun listenHostIsIpv6() {
         assertEquals("::", listenHost())
@@ -34,14 +65,22 @@ class PerfTest {
 
     @Test
     fun registerDoesNotQueryCatalog() {
+        resetPool()
+        resetCounts()
+        val connects = connectCount.get()
+        val sql = sqlCount.get()
+        register(4013, "http://127.0.0.1:1", "dev")
+        assertEquals(connects, connectCount.get(), "register opened Postgres")
+        assertEquals(sql, sqlCount.get(), "register ran SQL")
         val src = Files.readString(Path.of("src/main/kotlin/carolina/Main.kt"))
-        val start = src.indexOf("private fun register(")
+        val start = src.indexOf("fun register(")
         assertTrue(start >= 0, "register exists")
         val fn = src.substring(start)
         assertTrue(!fn.contains("openPool()"), "register-once does not open the pool")
         assertTrue(!fn.contains("openConnection()"), "register-once does not open Postgres")
         assertTrue(!fn.contains("query("), "register-once does not run catalog SQL")
         assertTrue(!fn.contains("withDb"), "register-once does not check out a connection")
+        resetPool()
     }
 
     @Test
@@ -61,41 +100,45 @@ class PerfTest {
 
     @Test
     fun yearListingSqlBoundedAndYearsDesc() {
-        val live = try {
-            openPool()
-            true
-        } catch (exc: Exception) {
-            System.err.println("postgres unavailable, using query hook: ${exc.message}")
-            connectFn = { throw SQLException("fake") }
-            queryFn = { sql, _ ->
-                val rows = mutableListOf<MutableMap<String, Any?>>()
-                when {
-                    sql.contains("FROM v1_speakers") -> {
-                        repeat(3) { i ->
-                            rows.add(mutableMapOf("slug" to "s$i", "first_name" to "A", "last_name" to "B"))
+        resetPool()
+        resetCounts()
+        val live =
+            try {
+                openPool()
+                true
+            } catch (exc: Exception) {
+                System.err.println("postgres unavailable, using query hook: ${exc.message}")
+                connectFn = { parkedConnection() }
+                queryFn = { sql, _ ->
+                    val rows = mutableListOf<MutableMap<String, Any?>>()
+                    when {
+                        sql.contains("FROM v1_speakers") -> {
+                            repeat(3) { i ->
+                                rows.add(mutableMapOf("slug" to "s$i", "first_name" to "A", "last_name" to "B"))
+                            }
+                        }
+                        sql.contains("ANY(") -> {
+                            rows.add(mutableMapOf("speaker_slug" to "s0", "year" to 2026))
+                            rows.add(mutableMapOf("speaker_slug" to "s0", "year" to 2024))
+                        }
+                        sql.contains("FROM v1_talks") -> {
+                            rows.add(
+                                mutableMapOf(
+                                    "slug" to "t0",
+                                    "title" to "Talk",
+                                    "speaker_slug" to "s0",
+                                    "year" to 2026,
+                                    "languages" to listOf("kotlin"),
+                                    "topics" to emptyList<String>(),
+                                ),
+                            )
                         }
                     }
-                    sql.contains("ANY(") -> {
-                        rows.add(mutableMapOf("speaker_slug" to "s0", "year" to 2026))
-                        rows.add(mutableMapOf("speaker_slug" to "s0", "year" to 2024))
-                    }
-                    sql.contains("FROM v1_talks") -> {
-                        rows.add(
-                            mutableMapOf(
-                                "slug" to "t0",
-                                "title" to "Talk",
-                                "speaker_slug" to "s0",
-                                "year" to 2026,
-                                "languages" to listOf("kotlin"),
-                                "topics" to emptyList<String>(),
-                            ),
-                        )
-                    }
+                    rows
                 }
-                rows
+                openPool()
+                false
             }
-            false
-        }
 
         val bootConnects = connectCount.get()
         sqlCount.set(0)
@@ -112,29 +155,42 @@ class PerfTest {
                 "year list status=${response.status.value} sql=$sql speakers=$speakers connects=${connectCount.get()}",
             )
 
-            if (live && response.status != HttpStatusCode.OK) {
-                fail("live year listing status ${response.status.value} body ${body.take(400)}")
+            if (response.status != HttpStatusCode.OK) {
+                fail("year listing status ${response.status.value} body ${body.take(400)} live=$live")
             }
+            assertTrue(speakers >= 3, "year listing returns N>=3 speakers, got $speakers")
+            assertTrue(sql > 0, "listing runs SQL through shipped query wrapper")
+            assertTrue(sql < 2 * speakers, "SQL count $sql grew like 2N for N=$speakers")
+            assertTrue(sql <= 4, "year listing SQL $sql should be speakers+talks+years")
+            assertYearsDescJson(body)
+            assertEquals(bootConnects, connectCount.get(), "listing opened a new session")
 
-            if (response.status == HttpStatusCode.OK) {
-                assertTrue(speakers >= 3, "year listing returns N>=3 speakers, got $speakers")
-                assertTrue(sql > 0, "listing runs SQL through shipped query wrapper")
-                assertTrue(sql < 2 * speakers, "SQL count $sql grew like 2N for N=$speakers")
-                assertTrue(sql <= 4, "year listing SQL $sql should be speakers+talks+years")
-                assertYearsDescJson(body)
-                assertEquals(bootConnects, connectCount.get(), "listing opened a new session")
+            val rows = withDb { conn -> listSpeakers(conn, 2026) }
+            assertYearsDescMaps(rows)
 
-                val rows = withDb { conn -> listSpeakers(conn, 2026) }
-                assertYearsDescMaps(rows)
-
-                sqlCount.set(0)
-                val second = client.get("/v1/speakers?year=2026")
-                assertEquals(HttpStatusCode.OK, second.status, "second catalog request succeeds")
-                assertEquals(bootConnects, connectCount.get(), "second catalog request opened a new session")
-            } else {
-                assertTrue(sql < 2 * 3, "failed listing did not run per-row SQL for N=3")
-            }
+            sqlCount.set(0)
+            val second = client.get("/v1/speakers?year=2026")
+            assertEquals(HttpStatusCode.OK, second.status, "second catalog request succeeds")
+            assertEquals(bootConnects, connectCount.get(), "second catalog request opened a new session")
         }
+    }
+
+    private fun parkedConnection(): Connection {
+        val handler =
+            java.lang.reflect.InvocationHandler { _, method, _ ->
+                when (method.returnType) {
+                    Void.TYPE -> null
+                    java.lang.Boolean.TYPE -> false
+                    Integer.TYPE -> 0
+                    java.lang.Long.TYPE -> 0L
+                    else -> null
+                }
+            }
+        return Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf(Connection::class.java),
+            handler,
+        ) as Connection
     }
 
     private fun assertYearsDescJson(body: String) {

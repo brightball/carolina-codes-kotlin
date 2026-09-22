@@ -10,12 +10,12 @@ primary_region = "iad"
   PORT = "8080"
   CAROLINA_URL = "http://carolina-codes.internal:8080"
   PUBLIC_BASE_URL = "https://carolina-codes-kotlin.fly.dev"
-  JAVA_OPTS = "-XX:MaxRAMPercentage=55.0 -XX:+UseG1GC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError"
+  JAVA_OPTS = "-XX:MaxRAMPercentage=55.0 -XX:+UseG1GC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = "suspend"
   auto_start_machines = true
   min_machines_running = 0
   processes = ["app"]

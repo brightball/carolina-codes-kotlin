@@ -1,0 +1,58 @@
+# Security-oriented detekt 2.x config on top of the defaults (buildUponDefaultConfig).
+# Style is owned by ktlint; complexity thresholds match this single-file Ktor app.
+complexity:
+  LongMethod:
+    active: true
+    allowedLines: 90
+  LongParameterList:
+    active: true
+    allowedFunctionParameters: 8
+    allowedConstructorParameters: 10
+  TooManyFunctions:
+    active: true
+    allowedFunctionsPerFile: 50
+    allowedFunctionsPerClass: 50
+    ignoreDeprecated: true
+    ignorePrivate: false
+    ignoreOverridden: true
+  CyclomaticComplexMethod:
+    active: true
+    allowedComplexity: 20
+  NestedBlockDepth:
+    active: true
+    allowedDepth: 5
+  LargeClass:
+    active: true
+    allowedLines: 900
+
+coroutines:
+  active: true
+
+exceptions:
+  active: true
+  TooGenericExceptionCaught:
+    active: true
+
+naming:
+  active: true
+
+potential-bugs:
+  active: true
+  UnsafeCallOnNullableType:
+    active: true
+  UnsafeCast:
+    active: true
+  UnnecessaryNotNullOperator:
+    active: true
+  HasPlatformType:
+    active: true
+  LateinitUsage:
+    active: true
+  UnreachableCode:
+    active: true
+
+performance:
+  active: true
+
+style:
+  active: false

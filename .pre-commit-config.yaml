@@ -1,0 +1,36 @@
+# Local pre-commit hooks. Emergency escape: SKIP=test,sast,deps,gitleaks,style git commit
+# Install once: make hooks   (or: pre-commit install && git config core.hooksPath .githooks)
+fail_fast: false
+repos:
+  - repo: local
+    hooks:
+      - id: test
+        name: test
+        language: system
+        entry: ./gradlew --no-daemon test
+        pass_filenames: false
+        always_run: true
+      - id: sast
+        name: sast
+        language: system
+        entry: ./gradlew --no-daemon detekt
+        pass_filenames: false
+        always_run: true
+      - id: deps
+        name: deps
+        language: system
+        entry: ./gradlew --no-daemon osvScan
+        pass_filenames: false
+        always_run: true
+      - id: gitleaks
+        name: gitleaks
+        language: system
+        entry: gitleaks detect --source . --verbose
+        pass_filenames: false
+        always_run: true
+      - id: style
+        name: style
+        language: system
+        entry: ./gradlew --no-daemon ktlintCheck
+        pass_filenames: false
+        always_run: true

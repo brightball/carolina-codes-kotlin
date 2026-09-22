@@ -1,4 +1,18 @@
 [tools]
 kotlin = "2.2.20"
-java = "26"
+java = "27"
 gradle = "9.7.1"
+gitleaks = "8.30.1"
+osv-scanner = "2.2.3"
+
+[tasks.check]
+description = "Run the five named precommit checks (test, sast, deps, gitleaks, style)"
+run = "pre-commit run --all-files"
+
+[tasks.hooks]
+description = "Install the committed pre-commit runner and in-repo hooksPath"
+run = "pre-commit install && git config core.hooksPath .githooks"
+
+[tasks.secrets]
+description = "Scan for secrets with gitleaks"
+run = "gitleaks detect --source . --verbose"

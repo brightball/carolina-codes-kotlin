@@ -13,8 +13,12 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.response.header
 import io.ktor.server.response.respondBytes
+import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.routing
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.net.URI
 import java.net.URLEncoder
 import java.net.http.HttpClient
@@ -30,8 +34,6 @@ import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 
 const val LANGUAGE = "Kotlin"
 const val API_VERSION = "0.2.0"
@@ -40,17 +42,18 @@ const val CREATED_YEAR = 2026
 const val SCHEMA_VERSION = 1
 const val LANGUAGE_VERSION = "2.2.20"
 
-val ENDPOINTS = listOf(
-    mapOf("method" to "GET", "path" to "/", "query" to emptyList<String>()),
-    mapOf("method" to "GET", "path" to "/health", "query" to emptyList<String>()),
-    mapOf("method" to "GET", "path" to "/v1/years", "query" to emptyList<String>()),
-    mapOf("method" to "GET", "path" to "/v1/speakers", "query" to listOf("year")),
-    mapOf("method" to "GET", "path" to "/v1/speakers/:slug", "query" to emptyList<String>()),
-    mapOf("method" to "GET", "path" to "/v1/speakers/:year/:slug", "query" to emptyList<String>()),
-    mapOf("method" to "GET", "path" to "/v1/sponsors", "query" to listOf("year")),
-    mapOf("method" to "GET", "path" to "/v1/sponsors/:slug", "query" to emptyList<String>()),
-    mapOf("method" to "GET", "path" to "/v1/sponsors/:year/:slug", "query" to emptyList<String>()),
-)
+val ENDPOINTS =
+    listOf(
+        mapOf("method" to "GET", "path" to "/", "query" to emptyList<String>()),
+        mapOf("method" to "GET", "path" to "/health", "query" to emptyList<String>()),
+        mapOf("method" to "GET", "path" to "/v1/years", "query" to emptyList<String>()),
+        mapOf("method" to "GET", "path" to "/v1/speakers", "query" to listOf("year")),
+        mapOf("method" to "GET", "path" to "/v1/speakers/:slug", "query" to emptyList<String>()),
+        mapOf("method" to "GET", "path" to "/v1/speakers/:year/:slug", "query" to emptyList<String>()),
+        mapOf("method" to "GET", "path" to "/v1/sponsors", "query" to listOf("year")),
+        mapOf("method" to "GET", "path" to "/v1/sponsors/:slug", "query" to emptyList<String>()),
+        mapOf("method" to "GET", "path" to "/v1/sponsors/:year/:slug", "query" to emptyList<String>()),
+    )
 
 const val SPEAKER_COLS =
     "slug, first_name, last_name, name, tagline, bio, company, location, photo_path, twitter_url, linkedin_url, website_url, github_url, featured"
@@ -78,10 +81,16 @@ internal var connectFn: (() -> Connection)? = null
 internal var queryFn: ((String, Array<out Any?>) -> MutableList<MutableMap<String, Any?>>)? = null
 
 fun main() {
-    loadDriver()
-    openPool()
-    val listenPort = env("PORT", "4013").toInt()
-    thread(isDaemon = true, name = "polyglot-register") { register(listenPort) }
+    val server = serve(env("PORT", "4013").toInt())
+    try {
+        Thread.currentThread().join()
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        server.stop(1_000, 5_000)
+    }
+}
+
+internal fun serve(listenPort: Int) =
     embeddedServer(
         CIO,
         applicationEnvironment(),
@@ -95,7 +104,34 @@ fun main() {
             callGroupSize = 2
         },
         Application::carolinaModule,
-    ).start(wait = true)
+    ).also { server ->
+        server.start(wait = false)
+        thread(isDaemon = true, name = "polyglot-register") { register(listenPort) }
+        thread(isDaemon = true, name = "pool-warm") {
+            try {
+                openPool()
+            } catch (exc: SQLException) {
+                System.err.println("pool warm: $exc")
+            }
+        }
+    }
+
+internal fun resetPool() {
+    val closing = ArrayList<Connection>()
+    synchronized(poolLock) {
+        closing.addAll(idle)
+        idle.clear()
+        poolOpened = 0
+        poolReady = false
+    }
+    closing.forEach { conn ->
+        try {
+            conn.close()
+        } catch (_: SQLException) {
+        }
+    }
+    connectFn = null
+    queryFn = null
 }
 
 internal fun listenHost(): String = "::"
@@ -112,36 +148,49 @@ fun Application.carolinaModule() {
         }
     }
     routing {
-        get("/") {
-            call.json(
-                mapOf(
-                    "language" to LANGUAGE,
-                    "language_version" to LANGUAGE_VERSION,
-                    "api_version" to API_VERSION,
-                    "framework" to FRAMEWORK,
-                    "created_year" to CREATED_YEAR,
-                    "schema_version" to SCHEMA_VERSION,
-                    "endpoints" to ENDPOINTS,
-                ),
-            )
-        }
-        get("/health") { call.json(mapOf("ok" to true)) }
-        get("/v1/years") {
-            val rows = withDbIo { conn ->
+        installRootRoutes()
+        installSpeakerRoutes()
+        installSponsorRoutes()
+        get("{path...}") { call.notFound() }
+    }
+}
+
+private fun Route.installRootRoutes() {
+    get("/") {
+        call.json(
+            mapOf(
+                "language" to LANGUAGE,
+                "language_version" to LANGUAGE_VERSION,
+                "api_version" to API_VERSION,
+                "framework" to FRAMEWORK,
+                "created_year" to CREATED_YEAR,
+                "schema_version" to SCHEMA_VERSION,
+                "endpoints" to ENDPOINTS,
+            ),
+        )
+    }
+    get("/health") { call.json(mapOf("ok" to true)) }
+    get("/v1/years") {
+        val rows =
+            withDbIo { conn ->
                 query(conn, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC")
             }
-            call.json(mapOf("data" to rows))
-        }
-        get("/v1/speakers") {
-            val year = call.request.queryParameters["year"]?.toIntOrNull()
-            val speakers = withDbIo { conn -> listSpeakers(conn, year) }
-            call.json(mapOf("data" to speakers))
-        }
-        get("/v1/speakers/{year}/{slug}") {
-            val year = call.parameters["year"]?.toIntOrNull()
-            val slug = call.parameters["slug"] ?: return@get call.notFound()
-            if (year == null) return@get call.notFound()
-            val speaker = withDbIo { conn ->
+        call.json(mapOf("data" to rows))
+    }
+}
+
+private fun Route.installSpeakerRoutes() {
+    get("/v1/speakers") {
+        val year = call.request.queryParameters["year"]?.toIntOrNull()
+        val speakers = withDbIo { conn -> listSpeakers(conn, year) }
+        call.json(mapOf("data" to speakers))
+    }
+    get("/v1/speakers/{year}/{slug}") {
+        val year = call.parameters["year"]?.toIntOrNull()
+        val slug = call.parameters["slug"] ?: return@get call.notFound()
+        if (year == null) return@get call.notFound()
+        val speaker =
+            withDbIo { conn ->
                 val row = loadSpeaker(conn, slug) ?: return@withDbIo null
                 val talks = talksFor(conn, slug, year)
                 if (talks.isEmpty()) return@withDbIo null
@@ -154,22 +203,27 @@ fun Application.carolinaModule() {
                 row["topics"] = uniqTags(talks, "topics")
                 row
             } ?: return@get call.notFound()
-            call.json(mapOf("data" to speaker))
-        }
-        get("/v1/speakers/{slug}") {
-            val slug = call.parameters["slug"] ?: return@get call.notFound()
-            val speaker = withDbIo { conn ->
+        call.json(mapOf("data" to speaker))
+    }
+    get("/v1/speakers/{slug}") {
+        val slug = call.parameters["slug"] ?: return@get call.notFound()
+        val speaker =
+            withDbIo { conn ->
                 val row = loadSpeaker(conn, slug) ?: return@withDbIo null
                 val talks = talksFor(conn, slug, null)
                 row["talks"] = talks
                 row["years"] = yearsFromTalks(talks)
                 row
             } ?: return@get call.notFound()
-            call.json(mapOf("data" to speaker))
-        }
-        get("/v1/sponsors") {
-            val year = call.request.queryParameters["year"]?.toIntOrNull()
-            val rows = withDbIo { conn ->
+        call.json(mapOf("data" to speaker))
+    }
+}
+
+private fun Route.installSponsorRoutes() {
+    get("/v1/sponsors") {
+        val year = call.request.queryParameters["year"]?.toIntOrNull()
+        val rows =
+            withDbIo { conn ->
                 if (year != null) {
                     query(
                         conn,
@@ -180,48 +234,54 @@ fun Application.carolinaModule() {
                     query(conn, "SELECT $SPONSOR_COLS FROM v1_sponsors ORDER BY name")
                 }
             }
-            call.json(mapOf("data" to rows))
-        }
-        get("/v1/sponsors/{year}/{slug}") {
-            val year = call.parameters["year"]?.toIntOrNull()
-            val slug = call.parameters["slug"] ?: return@get call.notFound()
-            if (year == null) return@get call.notFound()
-            val row = withDbIo { conn ->
-                val sponsor = queryOne(
-                    conn,
-                    "SELECT $YEAR_SPONSOR_COLS FROM v1_year_sponsors WHERE year = ? AND slug = ?",
-                    year,
-                    slug,
-                ) ?: return@withDbIo null
+        call.json(mapOf("data" to rows))
+    }
+    get("/v1/sponsors/{year}/{slug}") {
+        val year = call.parameters["year"]?.toIntOrNull()
+        val slug = call.parameters["slug"] ?: return@get call.notFound()
+        if (year == null) return@get call.notFound()
+        val row =
+            withDbIo { conn ->
+                val sponsor =
+                    queryOne(
+                        conn,
+                        "SELECT $YEAR_SPONSOR_COLS FROM v1_year_sponsors WHERE year = ? AND slug = ?",
+                        year,
+                        slug,
+                    ) ?: return@withDbIo null
                 val years = sponsorYears(conn, slug)
                 sponsor["years"] = years
                 sponsor["other_years"] = years.filter { it != year }
                 sponsor
             } ?: return@get call.notFound()
-            call.json(mapOf("data" to row))
-        }
-        get("/v1/sponsors/{slug}") {
-            val slug = call.parameters["slug"] ?: return@get call.notFound()
-            val row = withDbIo { conn ->
-                val sponsor = queryOne(
-                    conn,
-                    "SELECT $SPONSOR_COLS FROM v1_sponsors WHERE slug = ?",
-                    slug,
-                ) ?: return@withDbIo null
-                sponsor["sponsorships"] = query(
-                    conn,
-                    "SELECT sponsor_slug, year, tier, blurb, featured FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC",
-                    slug,
-                )
+        call.json(mapOf("data" to row))
+    }
+    get("/v1/sponsors/{slug}") {
+        val slug = call.parameters["slug"] ?: return@get call.notFound()
+        val row =
+            withDbIo { conn ->
+                val sponsor =
+                    queryOne(
+                        conn,
+                        "SELECT $SPONSOR_COLS FROM v1_sponsors WHERE slug = ?",
+                        slug,
+                    ) ?: return@withDbIo null
+                sponsor["sponsorships"] =
+                    query(
+                        conn,
+                        "SELECT sponsor_slug, year, tier, blurb, featured FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC",
+                        slug,
+                    )
                 sponsor
             } ?: return@get call.notFound()
-            call.json(mapOf("data" to row))
-        }
-        get("{path...}") { call.notFound() }
+        call.json(mapOf("data" to row))
     }
 }
 
-private suspend fun ApplicationCall.json(payload: Any, status: HttpStatusCode = HttpStatusCode.OK) {
+private suspend fun ApplicationCall.json(
+    payload: Any,
+    status: HttpStatusCode = HttpStatusCode.OK,
+) {
     response.header("X-Polyglot-Language", LANGUAGE)
     response.header("X-Polyglot-Framework", FRAMEWORK)
     respondBytes(mapper.writeValueAsBytes(payload), ContentType.Application.Json, status)
@@ -231,7 +291,10 @@ private suspend fun ApplicationCall.notFound() {
     json(mapOf("error" to "not_found"), HttpStatusCode.NotFound)
 }
 
-internal fun env(key: String, fallback: String): String {
+internal fun env(
+    key: String,
+    fallback: String,
+): String {
     val value = System.getenv(key)
     return if (value.isNullOrBlank()) fallback else value
 }
@@ -258,7 +321,11 @@ internal fun jdbcUrl(): String {
     return jdbc
 }
 
-internal fun appendParam(jdbc: String, key: String, value: String): String {
+internal fun appendParam(
+    jdbc: String,
+    key: String,
+    value: String,
+): String {
     if (jdbc.contains("$key=")) return jdbc
     return "$jdbc&$key=$value"
 }
@@ -290,7 +357,7 @@ internal fun openPool() {
             try {
                 idle.addLast(openConnection())
                 poolOpened++
-            } catch (_: Exception) {
+            } catch (_: SQLException) {
                 break
             }
         }
@@ -331,7 +398,7 @@ internal fun takeIdleOrGrow(): Connection? {
     }
     return try {
         openConnection()
-    } catch (exc: Exception) {
+    } catch (exc: SQLException) {
         synchronized(poolLock) {
             poolOpened = (poolOpened - 1).coerceAtLeast(0)
             @Suppress("PLATFORM_CLASS_MAPPED_TO_KOTLIN")
@@ -357,7 +424,7 @@ internal fun discardBroken(conn: Connection?) {
     if (conn != null) {
         try {
             conn.close()
-        } catch (_: Exception) {
+        } catch (_: SQLException) {
         }
     }
 }
@@ -384,10 +451,13 @@ internal fun <T> withDb(block: (Connection) -> T): T {
     }
 }
 
-internal suspend fun <T> withDbIo(block: (Connection) -> T): T =
-    withContext(Dispatchers.IO) { withDb(block) }
+internal suspend fun <T> withDbIo(block: (Connection) -> T): T = withContext(Dispatchers.IO) { withDb(block) }
 
-internal fun query(conn: Connection, sql: String, vararg args: Any?): MutableList<MutableMap<String, Any?>> {
+internal fun query(
+    conn: Connection,
+    sql: String,
+    vararg args: Any?,
+): MutableList<MutableMap<String, Any?>> {
     sqlCount.incrementAndGet()
     queryFn?.let { return it(sql, args) }
     conn.prepareStatement(sql).use { stmt ->
@@ -401,7 +471,12 @@ internal fun query(conn: Connection, sql: String, vararg args: Any?): MutableLis
     }
 }
 
-private fun bind(stmt: java.sql.PreparedStatement, conn: Connection, idx: Int, value: Any?) {
+private fun bind(
+    stmt: java.sql.PreparedStatement,
+    conn: Connection,
+    idx: Int,
+    value: Any?,
+) {
     when (value) {
         is Int -> stmt.setInt(idx, value)
         is Long -> stmt.setLong(idx, value)
@@ -411,16 +486,21 @@ private fun bind(stmt: java.sql.PreparedStatement, conn: Connection, idx: Int, v
     }
 }
 
-internal fun queryOne(conn: Connection, sql: String, vararg args: Any?): MutableMap<String, Any?>? {
-    return query(conn, sql, *args).firstOrNull()
-}
+internal fun queryOne(
+    conn: Connection,
+    sql: String,
+    vararg args: Any?,
+): MutableMap<String, Any?>? = query(conn, sql, *args).firstOrNull()
 
 private fun columnLabels(rs: ResultSet): Array<String> {
     val md = rs.metaData
     return Array(md.columnCount) { md.getColumnLabel(it + 1) }
 }
 
-private fun row(rs: ResultSet, labels: Array<String>): MutableMap<String, Any?> {
+private fun row(
+    rs: ResultSet,
+    labels: Array<String>,
+): MutableMap<String, Any?> {
     val out = linkedMapOf<String, Any?>()
     for (i in labels.indices) {
         out[labels[i]] = clean(rs.getObject(i + 1))
@@ -428,8 +508,8 @@ private fun row(rs: ResultSet, labels: Array<String>): MutableMap<String, Any?> 
     return out
 }
 
-private fun clean(value: Any?): Any? {
-    return when (value) {
+private fun clean(value: Any?): Any? =
+    when (value) {
         null -> null
         is java.sql.Array -> {
             val arr = value.array as Array<*>
@@ -439,17 +519,20 @@ private fun clean(value: Any?): Any? {
         is java.sql.Timestamp -> value.toString()
         else -> value
     }
-}
 
-internal fun listSpeakers(conn: Connection, year: Int?): MutableList<MutableMap<String, Any?>> {
+internal fun listSpeakers(
+    conn: Connection,
+    year: Int?,
+): MutableList<MutableMap<String, Any?>> {
     if (year == null) {
         return query(conn, "SELECT $SPEAKER_COLS FROM v1_speakers ORDER BY last_name, first_name")
     }
-    val speakers = query(
-        conn,
-        "SELECT $SPEAKER_COLS FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = ?) ORDER BY last_name, first_name",
-        year,
-    )
+    val speakers =
+        query(
+            conn,
+            "SELECT $SPEAKER_COLS FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = ?) ORDER BY last_name, first_name",
+            year,
+        )
     return attachYearTags(conn, speakers, year)
 }
 
@@ -476,7 +559,10 @@ internal fun attachYearTags(
     return speakers
 }
 
-internal fun loadTalksForYear(conn: Connection, year: Int): Map<String, List<MutableMap<String, Any?>>> {
+internal fun loadTalksForYear(
+    conn: Connection,
+    year: Int,
+): Map<String, List<MutableMap<String, Any?>>> {
     val out = linkedMapOf<String, MutableList<MutableMap<String, Any?>>>()
     query(
         conn,
@@ -489,7 +575,10 @@ internal fun loadTalksForYear(conn: Connection, year: Int): Map<String, List<Mut
     return out
 }
 
-internal fun loadYearsForSlugs(conn: Connection, slugs: List<String>): Map<String, List<Int>> {
+internal fun loadYearsForSlugs(
+    conn: Connection,
+    slugs: List<String>,
+): Map<String, List<Int>> {
     val out = linkedMapOf<String, MutableList<Int>>()
     if (slugs.isEmpty()) return out
     query(
@@ -503,19 +592,23 @@ internal fun loadYearsForSlugs(conn: Connection, slugs: List<String>): Map<Strin
     return out
 }
 
-private fun asInt(value: Any?): Int {
-    return when (value) {
+private fun asInt(value: Any?): Int =
+    when (value) {
         is Number -> value.toInt()
         else -> value.toString().toInt()
     }
-}
 
-internal fun loadSpeaker(conn: Connection, slug: String): MutableMap<String, Any?>? {
-    return queryOne(conn, "SELECT $SPEAKER_COLS FROM v1_speakers WHERE slug = ?", slug)
-}
+internal fun loadSpeaker(
+    conn: Connection,
+    slug: String,
+): MutableMap<String, Any?>? = queryOne(conn, "SELECT $SPEAKER_COLS FROM v1_speakers WHERE slug = ?", slug)
 
-internal fun talksFor(conn: Connection, slug: String, year: Int?): List<MutableMap<String, Any?>> {
-    return if (year == null) {
+internal fun talksFor(
+    conn: Connection,
+    slug: String,
+    year: Int?,
+): List<MutableMap<String, Any?>> =
+    if (year == null) {
         query(conn, "SELECT $TALK_COLS FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC", slug)
     } else {
         query(
@@ -525,12 +618,13 @@ internal fun talksFor(conn: Connection, slug: String, year: Int?): List<MutableM
             year,
         )
     }
-}
 
-internal fun talkYears(conn: Connection, slug: String): List<Int> {
-    return query(conn, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC", slug)
+internal fun talkYears(
+    conn: Connection,
+    slug: String,
+): List<Int> =
+    query(conn, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC", slug)
         .map { asInt(it["year"]) }
-}
 
 internal fun yearsFromTalks(talks: List<Map<String, Any?>>): List<Int> {
     val seen = linkedSetOf<Int>()
@@ -538,16 +632,21 @@ internal fun yearsFromTalks(talks: List<Map<String, Any?>>): List<Int> {
     return seen.toList()
 }
 
-internal fun sponsorYears(conn: Connection, slug: String): List<Int> {
-    return query(
+internal fun sponsorYears(
+    conn: Connection,
+    slug: String,
+): List<Int> =
+    query(
         conn,
         "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC",
         slug,
     ).map { asInt(it["year"]) }
-}
 
 @Suppress("UNCHECKED_CAST")
-internal fun uniqTags(talks: List<Map<String, Any?>>, key: String): List<String> {
+internal fun uniqTags(
+    talks: List<Map<String, Any?>>,
+    key: String,
+): List<String> {
     val seen = linkedSetOf<String>()
     talks.forEach { talk ->
         val values = talk[key] as? List<*> ?: emptyList<Any>()
@@ -559,34 +658,43 @@ internal fun uniqTags(talks: List<Map<String, Any?>>, key: String): List<String>
     return seen.toList()
 }
 
-private fun register(port: Int) {
-    val url = System.getenv("CAROLINA_URL") ?: return
-    val token = System.getenv("POLYGLOT_REGISTER_TOKEN") ?: return
-    if (url.isBlank() || token.isBlank()) return
+internal fun register(
+    port: Int,
+    carolinaUrl: String? = System.getenv("CAROLINA_URL"),
+    token: String? = System.getenv("POLYGLOT_REGISTER_TOKEN"),
+) {
+    val url = carolinaUrl ?: return
+    if (url.isBlank() || token.isNullOrBlank()) return
     val base = env("PUBLIC_BASE_URL", "http://127.0.0.1:$port")
-    val body = mapper.writeValueAsString(
-        mapOf(
-            "language" to LANGUAGE,
-            "language_version" to LANGUAGE_VERSION,
-            "api_version" to API_VERSION,
-            "framework" to FRAMEWORK,
-            "created_year" to CREATED_YEAR,
-            "schema_version" to SCHEMA_VERSION,
-            "base_url" to base,
-            "endpoints" to ENDPOINTS,
-        ),
-    )
-    val request = HttpRequest.newBuilder()
-        .uri(URI.create(url.trimEnd('/') + "/internal/api-endpoints/register"))
-        .timeout(Duration.ofSeconds(5))
-        .header("Authorization", "Bearer $token")
-        .header("Content-Type", "application/json")
-        .POST(HttpRequest.BodyPublishers.ofString(body))
-        .build()
+    val body =
+        mapper.writeValueAsString(
+            mapOf(
+                "language" to LANGUAGE,
+                "language_version" to LANGUAGE_VERSION,
+                "api_version" to API_VERSION,
+                "framework" to FRAMEWORK,
+                "created_year" to CREATED_YEAR,
+                "schema_version" to SCHEMA_VERSION,
+                "base_url" to base,
+                "endpoints" to ENDPOINTS,
+            ),
+        )
+    val request =
+        HttpRequest
+            .newBuilder()
+            .uri(URI.create(url.trimEnd('/') + "/internal/api-endpoints/register"))
+            .timeout(Duration.ofSeconds(5))
+            .header("Authorization", "Bearer $token")
+            .header("Content-Type", "application/json")
+            .POST(HttpRequest.BodyPublishers.ofString(body))
+            .build()
     try {
         val response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString())
         System.err.println("registered with elixir: ${response.statusCode()}")
-    } catch (exc: Exception) {
+    } catch (exc: IOException) {
+        System.err.println("register: $exc")
+    } catch (exc: InterruptedException) {
+        Thread.currentThread().interrupt()
         System.err.println("register: $exc")
     }
 }
