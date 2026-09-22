@@ -3,6 +3,7 @@
 # in parallel after one environment-prep job.
 #
 # act_runner starts a new container per job and blocks host bind-mounts.
+# Run steps are executed with dash, so scripts stay POSIX (`set -eu`, no pipes).
 # Prep token-clones GITHUB_SHA, installs packages/tools once, scrubs the
 # clone token from remote.origin.url, and uploads a workspace tarball
 # (source, .git, JDK, gitleaks, osv-scanner, Gradle home). Keep .git so
@@ -39,7 +40,7 @@ jobs:
     steps:
       - run: apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates curl nodejs
       - run: |
-          set -euo pipefail
+          set -eu
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
           host="${GITHUB_SERVER_URL#https://}"
@@ -50,12 +51,12 @@ jobs:
           git remote set-url origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           chmod +x gradlew
       - run: |
-          set -euo pipefail
+          set -eu
           mkdir -p .ci/bin
           curl -sSfL -o .ci/bin/osv-scanner https://github.com/google/osv-scanner/releases/download/v2.2.3/osv-scanner_linux_amd64
           chmod +x .ci/bin/osv-scanner
-          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            | tar -xzf - -C .ci/bin gitleaks
+          curl -sSfL -o /tmp/gitleaks.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C .ci/bin gitleaks
           chmod +x .ci/bin/gitleaks
           jdk_src="${JAVA_HOME:-/usr/local/openjdk-27}"
           test -d "$jdk_src"
@@ -66,7 +67,7 @@ jobs:
           export GRADLE_USER_HOME="$PWD/.ci/gradle-home"
           ./gradlew --no-daemon testClasses
       - run: |
-          set -euo pipefail
+          set -eu
           tar -czf /tmp/prep-workspace.tar.gz \
             --exclude=./prep-workspace.tar.gz \
             .
@@ -88,8 +89,8 @@ jobs:
         with:
           name: prep-workspace
       - run: |
-          set -euo pipefail
-          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          set -eu
+          archive="$(find . -name prep-workspace.tar.gz -print -quit)"
           test -n "$archive"
           tar -xzf "$archive" --no-same-owner
           chmod +x gradlew .ci/bin/*
@@ -109,8 +110,8 @@ jobs:
         with:
           name: prep-workspace
       - run: |
-          set -euo pipefail
-          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          set -eu
+          archive="$(find . -name prep-workspace.tar.gz -print -quit)"
           test -n "$archive"
           tar -xzf "$archive" --no-same-owner
           chmod +x gradlew .ci/bin/*
@@ -130,8 +131,8 @@ jobs:
         with:
           name: prep-workspace
       - run: |
-          set -euo pipefail
-          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          set -eu
+          archive="$(find . -name prep-workspace.tar.gz -print -quit)"
           test -n "$archive"
           tar -xzf "$archive" --no-same-owner
           chmod +x gradlew .ci/bin/*
@@ -151,8 +152,8 @@ jobs:
         with:
           name: prep-workspace
       - run: |
-          set -euo pipefail
-          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          set -eu
+          archive="$(find . -name prep-workspace.tar.gz -print -quit)"
           test -n "$archive"
           tar -xzf "$archive" --no-same-owner
           chmod +x gradlew .ci/bin/*
@@ -172,8 +173,8 @@ jobs:
         with:
           name: prep-workspace
       - run: |
-          set -euo pipefail
-          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          set -eu
+          archive="$(find . -name prep-workspace.tar.gz -print -quit)"
           test -n "$archive"
           tar -xzf "$archive" --no-same-owner
           chmod +x gradlew .ci/bin/*
